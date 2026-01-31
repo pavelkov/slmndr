@@ -13,6 +13,107 @@ def mask_barycenter(mask):
     return (x_mean, y_mean)
 
 
+def mask_farthest_pixel(mask, point, max_radius=None, a0=None, a1=None):
+    """Return (x, y) of the farthest non-zero mask pixel from point.
+
+    Args:
+        mask: Mask array or PIL image; non-zero pixels are considered.
+        point: (x, y) reference point in pixel coordinates.
+        max_radius: Optional maximum radius; ignore pixels farther than this.
+        a0/a1: Optional angle range (degrees) from +x axis to line p0->p1.
+            If provided, restrict to angles within [a0, a1] (wrap allowed).
+    """
+    mask_arr = np.asarray(mask)
+    if mask_arr.ndim > 2:
+        mask_arr = mask_arr[..., 0]
+    mask_bool = mask_arr > 0
+    coords = np.argwhere(mask_bool)
+    if coords.size == 0:
+        return None
+
+    x0, y0 = float(point[0]), float(point[1])
+    dy = coords[:, 0].astype(np.float64) - y0
+    dx = coords[:, 1].astype(np.float64) - x0
+    dist2 = dx * dx + dy * dy
+    if max_radius is not None:
+        max_r2 = float(max_radius) ** 2
+        valid = dist2 <= max_r2
+        if not np.any(valid):
+            return None
+        dist2 = np.where(valid, dist2, -1.0)
+
+    if a0 is not None or a1 is not None:
+        if a0 is None or a1 is None:
+            raise ValueError("a0 and a1 must be provided together")
+        angles = (np.degrees(np.arctan2(dy, dx)) + 360.0) % 360.0
+        a0f = float(a0) % 360.0
+        a1f = float(a1) % 360.0
+        if a0f <= a1f:
+            valid = (angles >= a0f) & (angles <= a1f)
+        else:
+            valid = (angles >= a0f) | (angles <= a1f)
+        if not np.any(valid):
+            return None
+        dist2 = np.where(valid, dist2, -1.0)
+
+    idx = int(np.argmax(dist2))
+    y_far = float(coords[idx, 0])
+    x_far = float(coords[idx, 1])
+    return (x_far, y_far)
+
+
+def mask_nearest_pixel(mask, point, return_distance=False):
+    """Return (x, y) of the nearest non-zero mask pixel to point.
+
+    Args:
+        mask: Mask array or PIL image; non-zero pixels are considered.
+        point: (x, y) reference point in pixel coordinates.
+        return_distance: If True, also return Euclidean distance.
+    """
+    mask_arr = np.asarray(mask)
+    if mask_arr.ndim > 2:
+        mask_arr = mask_arr[..., 0]
+    mask_bool = mask_arr > 0
+    coords = np.argwhere(mask_bool)
+    if coords.size == 0:
+        return None
+
+    x0, y0 = float(point[0]), float(point[1])
+    dy = coords[:, 0].astype(np.float64) - y0
+    dx = coords[:, 1].astype(np.float64) - x0
+    dist2 = dx * dx + dy * dy
+    idx = int(np.argmin(dist2))
+    y_near = float(coords[idx, 0])
+    x_near = float(coords[idx, 1])
+    if return_distance:
+        return (x_near, y_near), float(np.sqrt(dist2[idx]))
+    return (x_near, y_near)
+
+
+def angle_to_x_axis(p0, p1):
+    """Return angle in degrees from +x axis to line p0->p1 in [0, 360)."""
+    x0, y0 = float(p0[0]), float(p0[1])
+    x1, y1 = float(p1[0]), float(p1[1])
+    dx = x1 - x0
+    dy = y1 - y0
+    angle = float(np.degrees(np.arctan2(dy, dx)))
+    if angle < 0.0:
+        angle += 360.0
+    return angle
+
+
+def angle_range(a, w):
+    """Return (a-w, a+w) wrapped to [0, 360) while preserving circular ordering."""
+    a0 = (float(a) - float(w)) % 360.0
+    a1 = (float(a) + float(w)) % 360.0
+    return a0, a1
+
+
+def reverse_angle(a):
+    """Return angle opposite to a (add 180 degrees), wrapped to [0, 360)."""
+    return (float(a) + 180.0) % 360.0
+
+
 def overlay_points(image, points, color=(255, 0, 0), radius=3, alpha=0.8):
     """Return image with points drawn as filled circles."""
     if points is None:
@@ -403,13 +504,11 @@ def visualize_bin_rays(image, point, bins, bin_index, length=None, color=(0, 255
         width=width,
     )
 
+def mask_distance_transform(mask, r=5):
+    m = (mask > 0).astype(np.uint8)
+    return cv2.distanceTransform(m, cv2.DIST_L2, r)
 
-def ridge_from_distance(mask_u8, min_radius=1.0, do_thin=True):
-    m = (mask_u8 > 0).astype(np.uint8)
-
-    # distance to background
-    dist = cv2.distanceTransform(m, cv2.DIST_L2, 5)
-
+def ridge_from_distance(dist, min_radius=1.0, do_thin=True):
     # ridge = local maxima of dist (discrete)
     k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
     dist_dil = cv2.dilate(dist, k)
@@ -421,7 +520,7 @@ def ridge_from_distance(mask_u8, min_radius=1.0, do_thin=True):
         except Exception:
             pass
 
-    return ridge, dist
+    return ridge
 
 def viz(img):
     return PIL.Image.fromarray((255 * dist / dist.max()).astype('uint8'))
