@@ -13,12 +13,13 @@ def mask_barycenter(mask):
     return (x_mean, y_mean)
 
 
-def mask_farthest_pixel(mask, point, max_radius=None, a0=None, a1=None):
+def mask_farthest_pixel(mask, point, return_distance=False, max_radius=None, a0=None, a1=None):
     """Return (x, y) of the farthest non-zero mask pixel from point.
 
     Args:
         mask: Mask array or PIL image; non-zero pixels are considered.
         point: (x, y) reference point in pixel coordinates.
+        return_distance: If True, also return Euclidean distance.
         max_radius: Optional maximum radius; ignore pixels farther than this.
         a0/a1: Optional angle range (degrees) from +x axis to line p0->p1.
             If provided, restrict to angles within [a0, a1] (wrap allowed).
@@ -59,6 +60,8 @@ def mask_farthest_pixel(mask, point, max_radius=None, a0=None, a1=None):
     idx = int(np.argmax(dist2))
     y_far = float(coords[idx, 0])
     x_far = float(coords[idx, 1])
+    if return_distance:
+        return (x_far, y_far), float(np.sqrt(dist2[idx]))
     return (x_far, y_far)
 
 
@@ -112,6 +115,92 @@ def angle_range(a, w):
 def reverse_angle(a):
     """Return angle opposite to a (add 180 degrees), wrapped to [0, 360)."""
     return (float(a) + 180.0) % 360.0
+
+
+def bezier_from_polyline(points, closed=False, tension=1.0):
+    """Convert a polyline into cubic Bezier segments using Catmull-Rom spline.
+
+    Args:
+        points: Sequence of (x, y) points.
+        closed: If True, treat the polyline as closed.
+        tension: Handle length scale (1.0 matches uniform Catmull-Rom).
+    Returns:
+        List of cubic Bezier segments, each as a (4, 2) float array.
+    """
+    pts = np.asarray(points, dtype=np.float64)
+    if pts.size == 0:
+        return []
+    pts = np.reshape(pts, (-1, 2))
+    n = int(pts.shape[0])
+    if n < 2:
+        return []
+
+    t = float(tension) / 6.0
+    segments = []
+
+    if closed:
+        for i in range(n):
+            p0 = pts[(i - 1) % n]
+            p1 = pts[i % n]
+            p2 = pts[(i + 1) % n]
+            p3 = pts[(i + 2) % n]
+            c1 = p1 + (p2 - p0) * t
+            c2 = p2 - (p3 - p1) * t
+            segments.append(np.stack([p1, c1, c2, p2], axis=0))
+        return segments
+
+    for i in range(n - 1):
+        p0 = pts[i - 1] if i - 1 >= 0 else pts[i]
+        p1 = pts[i]
+        p2 = pts[i + 1]
+        p3 = pts[i + 2] if i + 2 < n else pts[i + 1]
+        c1 = p1 + (p2 - p0) * t
+        c2 = p2 - (p3 - p1) * t
+        segments.append(np.stack([p1, c1, c2, p2], axis=0))
+
+    return segments
+
+
+def draw_bezier(image, segments, color=(255, 0, 0), width=2, samples_per_segment=64, alpha=1.0):
+    """Draw cubic Bezier segments on an image."""
+    if segments is None:
+        return image
+
+    if isinstance(image, Image.Image):
+        base = image.copy()
+    else:
+        base = Image.fromarray(np.asarray(image))
+
+    if base.mode != "RGBA":
+        base = base.convert("RGBA")
+
+    overlay = Image.new("RGBA", base.size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
+    stroke = (int(color[0]), int(color[1]), int(color[2]), int(255 * alpha))
+
+    segs = np.asarray(segments, dtype=np.float64)
+    if segs.size == 0:
+        return image
+    segs = np.reshape(segs, (-1, 4, 2))
+
+    for seg in segs:
+        p0, p1, p2, p3 = seg
+        t = np.linspace(0.0, 1.0, int(samples_per_segment))
+        mt = 1.0 - t
+        curve = (
+            (mt ** 3)[:, None] * p0
+            + (3.0 * (mt ** 2) * t)[:, None] * p1
+            + (3.0 * mt * (t ** 2))[:, None] * p2
+            + (t ** 3)[:, None] * p3
+        )
+        pts = [tuple(map(float, xy)) for xy in curve]
+        if len(pts) >= 2:
+            draw.line(pts, fill=stroke, width=int(width))
+
+    out = Image.alpha_composite(base, overlay)
+    if isinstance(image, Image.Image):
+        return out
+    return np.asarray(out)
 
 
 def overlay_points(image, points, color=(255, 0, 0), radius=3, alpha=0.8):
@@ -665,3 +754,30 @@ def show_monochrome(image, cmap="gray", vmin=None, vmax=None, figsize=None, titl
         plt.show()
     except Exception:
         raise RuntimeError("No display backend available; install matplotlib or run in Jupyter.")
+
+def trace_direction(mask, p, a, r, a_range):
+    pp = []
+    pn = p
+    while pn:
+        a0, a1 = angle_range(a, a_range)
+        pn = mask_farthest_pixel(mask, pn, max_radius=r, a0=a0, a1=a1)
+        if not pn or (pn[0] - p[0]) ** 2 + (pn[1] - p[1]) ** 2 < 1:
+            return pp, a
+        a = angle_to_x_axis(p, pn)        
+        pp.append(pn)
+        p = pn
+    return pp, a
+
+def trace_ridges(ridge, deep_ridge, r, a_range):
+    c = mask_barycenter(deep_ridge)
+    p0 = mask_nearest_pixel(deep_ridge, c)
+    p1 = mask_farthest_pixel(deep_ridge, p0, max_radius=r)
+    a1 = angle_to_x_axis(p0, p1)
+    a0, a1r = angle_range(reverse_angle(a1), a_range)
+    p2 = mask_farthest_pixel(deep_ridge, p0, max_radius=r, a0=a0, a1=a1r)
+    a2 = angle_to_x_axis(p0, p2)
+    pp1, a1 = trace_direction(deep_ridge, p1, a1, r, a_range)
+    pp2, a2 = trace_direction(deep_ridge, p2, a2, r, a_range)
+    pp1p, _ = trace_direction(ridge, pp1[-1], a1, r, a_range)
+    pp2p, _ = trace_direction(ridge, pp2[-1], a2, r, a_range)
+    return pp1p[::-1] + pp1[::-1] + [p1, p0, p2] + pp2 + pp2p
