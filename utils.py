@@ -231,6 +231,40 @@ def overlay_points(image, points, color=(255, 0, 0), radius=3, alpha=0.8):
     return np.asarray(out)
 
 
+def overlay_mask(image, mask, color=(255, 0, 0)):
+    """Return image with a mask overlay using mask values as alpha."""
+    if mask is None:
+        return image
+
+    if isinstance(image, Image.Image):
+        base = image.copy()
+    else:
+        base = Image.fromarray(np.asarray(image))
+
+    if base.mode != "RGBA":
+        base = base.convert("RGBA")
+
+    mask_arr = np.asarray(mask)
+    if mask_arr.ndim > 2:
+        mask_arr = mask_arr[..., 0]
+
+    if np.issubdtype(mask_arr.dtype, np.floating):
+        max_val = float(np.nanmax(mask_arr)) if mask_arr.size else 1.0
+        scale = 255.0 if max_val <= 1.0 else 1.0
+        alpha_u8 = np.clip(mask_arr * scale, 0, 255).astype(np.uint8)
+    else:
+        alpha_u8 = np.clip(mask_arr, 0, 255).astype(np.uint8)
+
+    alpha_img = Image.fromarray(alpha_u8, mode="L").resize(base.size)
+    overlay = Image.new("RGBA", base.size, color + (0,))
+    overlay.putalpha(alpha_img)
+    out = Image.alpha_composite(base, overlay)
+
+    if isinstance(image, Image.Image):
+        return out
+    return np.asarray(out)
+
+
 def overlay_spot_masks_with_numbers(
     image,
     spots,
@@ -765,32 +799,46 @@ def trace_direction(mask, p, a, r, a_range):
         p = pn
     return pp, a
 
-def trace_ridges(ridge, deep_ridge, r, a_range, r_1_mul=2., a_range_mul=1.):
-    c = mask_barycenter(deep_ridge)
-    p0 = mask_nearest_pixel(deep_ridge, c)
-    p1 = mask_farthest_pixel(deep_ridge, p0, max_radius=r)
+
+def trace_ridges(ridge, r, a_range):
+    c = mask_barycenter(ridge)
+    p0 = mask_nearest_pixel(ridge, c)
+    p1 = mask_farthest_pixel(ridge, p0, max_radius=r)
     a1 = angle_to_x_axis(p0, p1)
     fa, ta = angle_range(reverse_angle(a1), a_range)
-    p2 = mask_farthest_pixel(deep_ridge, p0, max_radius=r, a0=fa, a1=ta)
+    p2 = mask_farthest_pixel(ridge, p0, max_radius=r, a0=fa, a1=ta)
     a2 = angle_to_x_axis(p0, p2)
-    pp1, a1 = trace_direction(deep_ridge, p1, a1, r, a_range)
-    pp2, a2 = trace_direction(deep_ridge, p2, a2, r, a_range)
-    # return pp1[::-1] + [p1, p0, p2] + pp2
-    pp1p = []
-    if pp1:
-        fa, ta = angle_range(a1, a_range_mul * a_range)
-        pp1pfirst = mask_farthest_pixel(ridge, pp1[-1], r_1_mul * r, a0=fa, a1=ta) # handling ridge discontinuity
-        if pp1pfirst:
-            a1 = angle_to_x_axis(pp1[-1], pp1pfirst)
-            pp1p, a1 = trace_direction(ridge, pp1pfirst, a1, r, a_range)
-            pp1p = [pp1pfirst] + pp1p        
-    pp2, a2 = trace_direction(deep_ridge, p2, a2, r, a_range)
-    pp2p = []
-    if pp2:
-        fa, ta = angle_range(a2, a_range_mul * a_range)
-        pp2pfirst = mask_farthest_pixel(ridge, pp2[-1], r_1_mul * r, a0=fa, a1=ta) # handling ridge discontinuity
-        if pp2pfirst:
-            a2 = angle_to_x_axis(pp2[-1], pp2pfirst)
-            pp2p, a2 = trace_direction(ridge, pp2pfirst, a2, r, a_range)
-            pp2p = [pp2pfirst] + pp2p
-    return pp1p[::-1] + pp1[::-1] + [p1, p0, p2] + pp2 + pp2p
+    pp1, a1 = trace_direction(ridge, p1, a1, r, a_range)
+    pp2, a2 = trace_direction(ridge, p2, a2, r, a_range)
+    return pp1[::-1] + [p1, p0, p2] + pp2
+
+
+# def trace_ridges(ridge, deep_ridge, r, a_range, r_1_mul=2., a_range_mul=1.):
+#     c = mask_barycenter(deep_ridge)
+#     p0 = mask_nearest_pixel(deep_ridge, c)
+#     p1 = mask_farthest_pixel(deep_ridge, p0, max_radius=r)
+#     a1 = angle_to_x_axis(p0, p1)
+#     fa, ta = angle_range(reverse_angle(a1), a_range)
+#     p2 = mask_farthest_pixel(deep_ridge, p0, max_radius=r, a0=fa, a1=ta)
+#     a2 = angle_to_x_axis(p0, p2)
+#     pp1, a1 = trace_direction(deep_ridge, p1, a1, r, a_range)
+#     pp2, a2 = trace_direction(deep_ridge, p2, a2, r, a_range)
+#     # return pp1[::-1] + [p1, p0, p2] + pp2
+#     pp1p = []
+#     if pp1:
+#         fa, ta = angle_range(a1, a_range_mul * a_range)
+#         pp1pfirst = mask_farthest_pixel(ridge, pp1[-1], r_1_mul * r, a0=fa, a1=ta) # handling ridge discontinuity
+#         if pp1pfirst:
+#             a1 = angle_to_x_axis(pp1[-1], pp1pfirst)
+#             pp1p, a1 = trace_direction(ridge, pp1pfirst, a1, r, a_range)
+#             pp1p = [pp1pfirst] + pp1p        
+#     pp2, a2 = trace_direction(deep_ridge, p2, a2, r, a_range)
+#     pp2p = []
+#     if pp2:
+#         fa, ta = angle_range(a2, a_range_mul * a_range)
+#         pp2pfirst = mask_farthest_pixel(ridge, pp2[-1], r_1_mul * r, a0=fa, a1=ta) # handling ridge discontinuity
+#         if pp2pfirst:
+#             a2 = angle_to_x_axis(pp2[-1], pp2pfirst)
+#             pp2p, a2 = trace_direction(ridge, pp2pfirst, a2, r, a_range)
+#             pp2p = [pp2pfirst] + pp2p
+#     return pp1p[::-1] + pp1[::-1] + [p1, p0, p2] + pp2 + pp2p
