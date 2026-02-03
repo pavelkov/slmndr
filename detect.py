@@ -438,6 +438,34 @@ class Spot:
         descriptor = Descriptor.from_detection(detection)
         return Spot(detection, descriptor)
 
+class Tail:
+    def __init__(self, detection, descriptor):
+        self.detection = detection
+        self.descriptor = descriptor
+
+    def store(self, path):
+        path = Path(path)
+        path.mkdir(parents=True, exist_ok=True)
+        self.detection.store(path / "detection")
+        if self.descriptor is not None:
+            self.descriptor.store(path / "descriptor")
+
+    @staticmethod
+    def load(path, load_images=False):
+        path = Path(path)
+        detection = Detection.load(path / "detection", load_images=load_images)
+        descriptor_path = path / "descriptor"
+        if descriptor_path.exists():
+            descriptor = Descriptor.load(descriptor_path, load_images=load_images)
+        else:
+            descriptor = Descriptor.load(path, load_images=load_images)
+        return Tail(detection, descriptor)
+
+    @staticmethod
+    def from_detection(detection):
+        descriptor = Descriptor.from_detection(detection)
+        return Tail(detection, descriptor)
+
 
 class Body:
     def __init__(self, detection, descriptor):
@@ -479,11 +507,12 @@ class Body:
 
 
 class Salamandra:
-    def __init__(self, path, original_image, body, spots):
+    def __init__(self, path, original_image, body, spots, tail=None):
         self.path = path
         self.original_image = original_image
         self.body = body
         self.spots = spots
+        self.tail = tail
     
     def store(self, path):
         path = Path(path)
@@ -491,6 +520,8 @@ class Salamandra:
         (path / "meta.json").write_text(json.dumps({"path": str(self.path) if self.path is not None else None}))
         self.original_image.save(path / "original.png")
         self.body.store(path / "body")
+        if self.tail is not None:
+            self.tail.store(path / "tail")
         for idx, spot in enumerate(self.spots):
             spot.store(path / f"spot_{idx}")
 
@@ -505,29 +536,40 @@ class Salamandra:
             stored_path = None
         original_image = Image.open(path / "original.png") if load_images else None
         body = Body.load(path / "body", load_images=load_images)
+        tail = None
+        tail_path = path / "tail"
+        if tail_path.exists():
+            tail = Tail.load(tail_path, load_images=load_images)
         spot_dirs = list(sorted(p for p in path.glob("spot_*") if p.is_dir()))
         spots = [None for _ in enumerate(spot_dirs)]
         for spot_dir in sorted(p for p in path.glob("spot_*") if p.is_dir()):
             spot_id = int(spot_dir.name[5:])
             spots[spot_id] = Spot.load(spot_dir, load_images=load_images)
-        return Salamandra(stored_path, original_image, body, spots)
+        return Salamandra(stored_path, original_image, body, spots, tail=tail)
 
     @staticmethod
     def from_image(detector, image_path):
         image = Image.open(image_path)
         salamandras = detector.detect(image, 'salamandra')
-        return [
-            Salamandra(
-                image_path,
-                image,
-                Body.from_detection(salamandra),
-                [
-                    Spot.from_detection(spot)
-                    for spot in detector.detect(Image.fromarray(salamandra.image), 'spot')
-                ],
+        results = []
+        for salamandra in salamandras:
+            spot_detections = detector.detect(Image.fromarray(salamandra.image), 'spot')
+            tail_detections = detector.detect(Image.fromarray(salamandra.masked_image), 'tail')
+            tail = (
+                Tail.from_detection(max(tail_detections, key=lambda d: d.score))
+                if tail_detections
+                else None
             )
-            for salamandra in salamandras
-        ]
+            results.append(
+                Salamandra(
+                    image_path,
+                    image,
+                    Body.from_detection(salamandra),
+                    [Spot.from_detection(spot) for spot in spot_detections],
+                    tail=tail,
+                )
+            )
+        return results
 
 
 

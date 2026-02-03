@@ -200,6 +200,212 @@ def draw_bezier(image, segments, color=(255, 0, 0), width=2, samples_per_segment
     return np.asarray(out)
 
 
+def bezier_point_tangent_at_arc(segments, t, samples_per_segment=128):
+    """Return point and unit tangent at normalized arc-length position t in [0, 1].
+
+    Args:
+        segments: Array-like of cubic Bezier segments, shape (N, 4, 2).
+        t: Normalized arc length position in [0, 1].
+        samples_per_segment: Sampling resolution per segment for arc length approximation.
+    Returns:
+        (point, tangent) where each is (x, y) float tuple.
+    """
+    segs = np.asarray(segments, dtype=np.float64)
+    if segs.size == 0:
+        raise ValueError("segments is empty")
+    segs = np.reshape(segs, (-1, 4, 2))
+
+    t = float(t)
+    t = 0.0 if t < 0.0 else 1.0 if t > 1.0 else t
+    samples_per_segment = max(2, int(samples_per_segment))
+
+    def bezier_eval(seg, u):
+        p0, p1, p2, p3 = seg
+        um = 1.0 - u
+        return (
+            (um ** 3) * p0
+            + 3.0 * (um ** 2) * u * p1
+            + 3.0 * um * (u ** 2) * p2
+            + (u ** 3) * p3
+        )
+
+    def bezier_deriv(seg, u):
+        p0, p1, p2, p3 = seg
+        um = 1.0 - u
+        return (
+            3.0 * (um ** 2) * (p1 - p0)
+            + 6.0 * um * u * (p2 - p1)
+            + 3.0 * (u ** 2) * (p3 - p2)
+        )
+
+    # Sample each segment to approximate cumulative arc length.
+    seg_lengths = []
+    seg_samples = []
+    for seg in segs:
+        u = np.linspace(0.0, 1.0, samples_per_segment)
+        pts = np.stack([bezier_eval(seg, ui) for ui in u], axis=0)
+        d = np.diff(pts, axis=0)
+        lens = np.sqrt((d ** 2).sum(axis=1))
+        cum = np.concatenate([[0.0], np.cumsum(lens)])
+        seg_lengths.append(cum[-1])
+        seg_samples.append((u, pts, cum))
+
+    total_len = float(np.sum(seg_lengths))
+    if total_len <= 0.0:
+        # Degenerate: all points the same.
+        p = tuple(map(float, segs[0, 0]))
+        return p, (0.0, 0.0)
+
+    target_len = t * total_len
+    acc = 0.0
+    seg_index = 0
+    for i, L in enumerate(seg_lengths):
+        if acc + L >= target_len or i == len(seg_lengths) - 1:
+            seg_index = i
+            break
+        acc += L
+
+    u_s, pts_s, cum_s = seg_samples[seg_index]
+    seg_target = target_len - acc
+    # Find bracketing sample indices.
+    idx = int(np.searchsorted(cum_s, seg_target, side="right")) - 1
+    idx = max(0, min(idx, len(cum_s) - 2))
+    l0 = cum_s[idx]
+    l1 = cum_s[idx + 1]
+    if l1 > l0:
+        frac = (seg_target - l0) / (l1 - l0)
+    else:
+        frac = 0.0
+    u0 = u_s[idx]
+    u1 = u_s[idx + 1]
+    u = (1.0 - frac) * u0 + frac * u1
+
+    seg = segs[seg_index]
+    p = bezier_eval(seg, u)
+    tan = bezier_deriv(seg, u)
+    tan_norm = float(np.hypot(tan[0], tan[1]))
+    if tan_norm > 0.0:
+        tan = tan / tan_norm
+    else:
+        tan = np.array([0.0, 0.0], dtype=np.float64)
+
+    return (float(p[0]), float(p[1])), (float(tan[0]), float(tan[1]))
+
+
+def perpendicular_vector(vec):
+    """Return a perpendicular unit vector in 2D.
+
+    Args:
+        vec: (x, y) vector.
+    Returns:
+        (x, y) unit vector perpendicular to vec. If vec is zero-length,
+        returns (0.0, 0.0).
+    """
+    v = np.asarray(vec, dtype=np.float64).reshape(-1)
+    if v.size < 2:
+        raise ValueError("vec must have at least 2 components")
+    x = float(v[0])
+    y = float(v[1])
+    px = -y
+    py = x
+    n = float(np.hypot(px, py))
+    if n == 0.0:
+        return (0.0, 0.0)
+    return (px / n, py / n)
+
+
+def line_continous_intersect(mask, x0, xt):
+    """Return total length of line intersection with component containing x0.
+
+    Args:
+        mask: 2D boolean/0-1 array.
+        x0: (x, y) point in pixel coordinates (guaranteed inside mask).
+        xt: direction unit vector (x, y). Line spans both directions.
+    Returns:
+        Total length along the line within the connected component containing x0.
+    """
+    mask_arr = np.asarray(mask)
+    if mask_arr.ndim > 2:
+        mask_arr = mask_arr[..., 0]
+    mask_bool = mask_arr > 0
+    h, w = mask_bool.shape[:2]
+
+    x0f, y0f = float(x0[0]), float(x0[1])
+    x0i = int(round(x0f))
+    y0i = int(round(y0f))
+    if x0i < 0 or x0i >= w or y0i < 0 or y0i >= h or not mask_bool[y0i, x0i]:
+        return 0.0
+
+    dx = float(xt[0])
+    dy = float(xt[1])
+    n = float(np.hypot(dx, dy))
+    if n == 0.0:
+        return 0.0
+    dx /= n
+    dy /= n
+
+    # Build connected component mask containing x0 (8-connectivity).
+    comp = np.zeros_like(mask_bool, dtype=bool)
+    from collections import deque
+
+    q = deque()
+    q.append((x0i, y0i))
+    comp[y0i, x0i] = True
+    while q:
+        x, y = q.popleft()
+        for oy in (-1, 0, 1):
+            for ox in (-1, 0, 1):
+                if ox == 0 and oy == 0:
+                    continue
+                xn = x + ox
+                yn = y + oy
+                if xn < 0 or xn >= w or yn < 0 or yn >= h:
+                    continue
+                if comp[yn, xn]:
+                    continue
+                if not mask_bool[yn, xn]:
+                    continue
+                comp[yn, xn] = True
+                q.append((xn, yn))
+
+    def inside(px, py):
+        ix = int(round(px))
+        iy = int(round(py))
+        if ix < 0 or ix >= w or iy < 0 or iy >= h:
+            return False
+        return comp[iy, ix]
+
+    step = 0.5
+
+    def march(sign):
+        dist = 0.0
+        px, py = x0f, y0f
+        last_inside = (px, py)
+        while True:
+            px = last_inside[0] + sign * dx * step
+            py = last_inside[1] + sign * dy * step
+            if not inside(px, py):
+                break
+            dist += step
+            last_inside = (px, py)
+
+        # Refine boundary between last_inside and first outside.
+        low = 0.0
+        high = step
+        for _ in range(12):
+            mid = (low + high) * 0.5
+            mx = last_inside[0] + sign * dx * mid
+            my = last_inside[1] + sign * dy * mid
+            if inside(mx, my):
+                low = mid
+            else:
+                high = mid
+        return dist + low
+
+    total = march(1.0) + march(-1.0)
+    return float(total)
+
+
 def overlay_points(image, points, color=(255, 0, 0), radius=3, alpha=0.8):
     """Return image with points drawn as filled circles."""
     if points is None:
