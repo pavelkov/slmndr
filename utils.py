@@ -292,6 +292,131 @@ def bezier_point_tangent_at_arc(segments, t, samples_per_segment=128):
     return (float(p[0]), float(p[1])), (float(tan[0]), float(tan[1]))
 
 
+def bezier_project_point(segments, point, samples_per_segment=128, refine_iters=20):
+    """Project a point onto a multi-segment cubic Bezier curve.
+
+    Args:
+        segments: Array-like of cubic Bezier segments, shape (N, 4, 2).
+        point: (x, y) point to project.
+        samples_per_segment: Sampling resolution per segment.
+        refine_iters: Golden-section refinement iterations per segment.
+    Returns:
+        (closest_point, arc_t) where arc_t is normalized arc-length in [0, 1].
+    """
+    segs = np.asarray(segments, dtype=np.float64)
+    if segs.size == 0:
+        raise ValueError("segments is empty")
+    segs = np.reshape(segs, (-1, 4, 2))
+
+    px = float(point[0])
+    py = float(point[1])
+    samples_per_segment = max(2, int(samples_per_segment))
+
+    def bezier_eval(seg, u):
+        p0, p1, p2, p3 = seg
+        um = 1.0 - u
+        return (
+            (um ** 3) * p0
+            + 3.0 * (um ** 2) * u * p1
+            + 3.0 * um * (u ** 2) * p2
+            + (u ** 3) * p3
+        )
+
+    def dist2_at(seg, u):
+        p = bezier_eval(seg, u)
+        dx = p[0] - px
+        dy = p[1] - py
+        return float(dx * dx + dy * dy)
+
+    # Pre-sample all segments for both distance search and arc-length approximation.
+    seg_lengths = []
+    seg_samples = []
+    for seg in segs:
+        u = np.linspace(0.0, 1.0, samples_per_segment)
+        pts = np.stack([bezier_eval(seg, ui) for ui in u], axis=0)
+        d = np.diff(pts, axis=0)
+        lens = np.sqrt((d ** 2).sum(axis=1))
+        cum = np.concatenate([[0.0], np.cumsum(lens)])
+        seg_lengths.append(cum[-1])
+        seg_samples.append((u, pts, cum))
+
+    total_len = float(np.sum(seg_lengths))
+    if total_len <= 0.0:
+        p = tuple(map(float, segs[0, 0]))
+        return p, 0.0
+
+    best_seg = 0
+    best_u = 0.0
+    best_d2 = None
+
+    # Coarse search per segment, then refine by golden-section search.
+    invphi = 0.6180339887498949
+    invphi2 = 1.0 - invphi
+    for si, seg in enumerate(segs):
+        u_s, pts_s, _ = seg_samples[si]
+        dx = pts_s[:, 0] - px
+        dy = pts_s[:, 1] - py
+        d2 = dx * dx + dy * dy
+        idx = int(np.argmin(d2))
+
+        if idx == 0:
+            a = float(u_s[0])
+            b = float(u_s[1])
+        elif idx == len(u_s) - 1:
+            a = float(u_s[-2])
+            b = float(u_s[-1])
+        else:
+            a = float(u_s[idx - 1])
+            b = float(u_s[idx + 1])
+
+        # Golden-section search on [a, b]
+        c = a + invphi2 * (b - a)
+        d = a + invphi * (b - a)
+        fc = dist2_at(seg, c)
+        fd = dist2_at(seg, d)
+        for _ in range(int(refine_iters)):
+            if fc < fd:
+                b = d
+                d = c
+                fd = fc
+                c = a + invphi2 * (b - a)
+                fc = dist2_at(seg, c)
+            else:
+                a = c
+                c = d
+                fc = fd
+                d = a + invphi * (b - a)
+                fd = dist2_at(seg, d)
+
+        u_best = 0.5 * (a + b)
+        d2_best = dist2_at(seg, u_best)
+        if best_d2 is None or d2_best < best_d2:
+            best_d2 = d2_best
+            best_seg = si
+            best_u = u_best
+
+    # Compute arc-length position for best segment/u using samples.
+    u_s, _, cum_s = seg_samples[best_seg]
+    idx = int(np.searchsorted(u_s, best_u, side="right")) - 1
+    idx = max(0, min(idx, len(u_s) - 2))
+    u0 = u_s[idx]
+    u1 = u_s[idx + 1]
+    l0 = cum_s[idx]
+    l1 = cum_s[idx + 1]
+    if u1 > u0:
+        frac = (best_u - u0) / (u1 - u0)
+    else:
+        frac = 0.0
+    seg_len_at_u = l0 + frac * (l1 - l0)
+
+    acc = float(np.sum(seg_lengths[:best_seg]))
+    arc_t = (acc + seg_len_at_u) / total_len
+    arc_t = 0.0 if arc_t < 0.0 else 1.0 if arc_t > 1.0 else arc_t
+
+    p_best = bezier_eval(segs[best_seg], best_u)
+    return (float(p_best[0]), float(p_best[1])), float(arc_t)
+
+
 def perpendicular_vector(vec):
     """Return a perpendicular unit vector in 2D.
 
