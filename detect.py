@@ -6,15 +6,16 @@ from sam3.model.sam3_image_processor import Sam3Processor
 import numpy as np
 import matplotlib
 import cv2
-from scipy.ndimage import gaussian_filter
+from skimage.morphology import medial_axis, skeletonize
 from pathlib import Path
 import json
 import torch
-from utils import mask_barycenter, normalized_yellow_intensity
+from utils import *
 
 
 SALAMANDRA_DB_ROOT = '/data/Env/Data/Slmndr/'
-
+LOOKUP_RADIUS_FACTOR = .5
+ANGLE_LOOKUP_RANGE = 40
 
 def dbg():
     import debugpy
@@ -468,9 +469,12 @@ class Tail:
 
 
 class Body:
-    def __init__(self, detection, descriptor):
+    def __init__(self, detection, descriptor, dist=None, skel_thin=None, bezier_curve=None):
         self.detection = detection
         self.descriptor = descriptor
+        self.dist = dist
+        self.skel_thin = skel_thin
+        self.bezier_curve = bezier_curve
 
     def store(self, path):
         path = Path(path)
@@ -478,6 +482,12 @@ class Body:
         self.detection.store(path / "detection")
         if self.descriptor is not None:
             self.descriptor.store(path / "descriptor")
+        if self.dist is not None:
+            np.save(path / "dist.npy", self.dist)
+        if self.skel_thin is not None:
+            np.save(path / "skel_thin.npy", self.skel_thin)
+        if self.bezier_curve is not None:
+            np.save(path / "bezier_curve.npy", np.asarray(self.bezier_curve, dtype=np.float64))
 
     @staticmethod
     def load(path, load_images=False):
@@ -498,12 +508,24 @@ class Body:
                 if legacy_keypoints.exists()
                 else None
             )
-        return Body(detection, descriptor)
+        dist_path = path / "dist.npy"
+        dist = np.load(dist_path) if dist_path.exists() else None
+        skel_path = path / "skel_thin.npy"
+        skel_thin = np.load(skel_path) if skel_path.exists() else None
+        bezier_path = path / "bezier_curve.npy"
+        bezier_curve = np.load(bezier_path) if bezier_path.exists() else None
+        return Body(detection, descriptor, dist, skel_thin, bezier_curve)
 
     @staticmethod
     def from_detection(detection):
         descriptor = Descriptor.from_detection(detection)
-        return Body(detection, descriptor)
+        dist = mask_distance_transform(detection.mask)
+        scale = np.quantile(dist[dist > 0], .9)
+        mask_deep = dist * (dist > scale)
+        skel_thin = skeletonize(mask_deep)
+        pp = trace_ridges(skel_thin, LOOKUP_RADIUS_FACTOR * scale, ANGLE_LOOKUP_RANGE)
+        b = bezier_from_polyline(pp)
+        return Body(detection, descriptor, dist, skel_thin, b)
 
 
 class Salamandra:
