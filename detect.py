@@ -469,9 +469,10 @@ class Tail:
 
 
 class Body:
-    def __init__(self, detection, descriptor, dist=None, skel_thin=None, bezier_curve=None):
+    def __init__(self, detection, descriptor, scale=None, dist=None, skel_thin=None, bezier_curve=None):
         self.detection = detection
         self.descriptor = descriptor
+        self.scale = scale
         self.dist = dist
         self.skel_thin = skel_thin
         self.bezier_curve = bezier_curve
@@ -482,6 +483,8 @@ class Body:
         self.detection.store(path / "detection")
         if self.descriptor is not None:
             self.descriptor.store(path / "descriptor")
+        if self.scale is not None:
+            np.save(path / "scale.npy", np.asarray(self.scale, dtype=np.float64))
         if self.dist is not None:
             np.save(path / "dist.npy", self.dist)
         if self.skel_thin is not None:
@@ -508,13 +511,20 @@ class Body:
                 if legacy_keypoints.exists()
                 else None
             )
+        scale_path = path / "scale.npy"
+        if scale_path.exists():
+            scale = np.load(scale_path)
+            if np.ndim(scale) == 0:
+                scale = float(scale)
+        else:
+            scale = None
         dist_path = path / "dist.npy"
         dist = np.load(dist_path) if dist_path.exists() else None
         skel_path = path / "skel_thin.npy"
         skel_thin = np.load(skel_path) if skel_path.exists() else None
         bezier_path = path / "bezier_curve.npy"
         bezier_curve = np.load(bezier_path) if bezier_path.exists() else None
-        return Body(detection, descriptor, dist, skel_thin, bezier_curve)
+        return Body(detection, descriptor, scale, dist, skel_thin, bezier_curve)
 
     @staticmethod
     def from_detection(detection):
@@ -525,7 +535,7 @@ class Body:
         skel_thin = skeletonize(mask_deep)
         pp = trace_ridges(skel_thin, LOOKUP_RADIUS_FACTOR * scale, ANGLE_LOOKUP_RANGE)
         b = bezier_from_polyline(pp)
-        return Body(detection, descriptor, dist, skel_thin, b)
+        return Body(detection, descriptor, scale, dist, skel_thin, b)
 
 
 class Salamandra:
