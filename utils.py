@@ -114,6 +114,11 @@ def reverse_angle(a):
     return (float(a) + 180.0) % 360.0
 
 
+def angle_diff(a0, a1):
+    """Return clockwise difference from a0 to a1 in [0, 360)."""
+    return (float(a0) - float(a1)) % 360.0
+
+
 def bezier_from_polyline(points, closed=False, tension=1.0):
     """Convert a polyline into cubic Bezier segments using Catmull-Rom spline.
 
@@ -1050,4 +1055,28 @@ def trace_ridges(ridge, r, a_range):
     pp1, a1 = trace_direction(ridge, p1, a1, r, a_range)
     pp2, a2 = trace_direction(ridge, p2, a2, r, a_range)
     return pp1[::-1] + [p1, p0, p2] + pp2
+
+
+def spot_center(spot):
+    b = mask_barycenter(spot.detection.mask)
+    x0 = spot.detection.bbox[0] +  b[0]
+    y0 = spot.detection.bbox[1] +  b[1]
+    return x0, y0
+
+def dist(p0, p1):
+    return math.sqrt((p1[0] - p0[0]) ** 2 + (p1[1] - p0[1]) ** 2)
+
+def spot_nbhs(salamandra, pct=20, scale_factor=1.):
+    centers = [spot_center(spot) for spot in salamandra.spots]
+    dd = np.array([[dist(p0, p1) for p0 in centers] for p1 in centers])
+    dd /= np.percentile(dd, pct)
+    close = (dd > 0) & (dd <= scale_factor)
+    nbh = {}
+    for i, center in enumerate(centers):
+        nbh_idx = [int(x) for x in np.flatnonzero(close[i, :])]
+        dst = [float(dd[i, j]) for j in nbh_idx]
+        angles = [angle_to_x_axis(center, centers[j]) for j in nbh_idx]
+        srt = np.argsort(dst)
+        nbh[i] = [(nbh_idx[j], dst[j], angles[j]) for j in srt]
+    return nbh
 
