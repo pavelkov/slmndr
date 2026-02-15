@@ -1,3 +1,4 @@
+import math
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 import cv2
@@ -11,6 +12,13 @@ def mask_barycenter(mask):
     y_mean = float(coords[:, 0].mean())
     x_mean = float(coords[:, 1].mean())
     return (x_mean, y_mean)
+
+
+def mask_barycenter_distance_quantile_area_ratio(mask, q):
+    dist = mask_distance_field_from_point(mask)
+    d = np.quantile(dist, q)
+    cov = [np.clip((distance_field_disk_coverage(dist, dd) * mask).sum() / (math.pi * dd * dd), 0., 1.) for dd in d]
+    return d, cov
 
 
 def mask_farthest_pixel(mask, point, max_radius=None, a0=None, a1=None):
@@ -872,6 +880,53 @@ def mask_distance_transform(mask, r=5):
     m = (mask > 0).astype(np.uint8)
     return cv2.distanceTransform(m, cv2.DIST_L2, r)
 
+def mask_distance_field_from_point(mask, point=None):
+    """Return float Euclidean distance field from point, multiplied by mask.
+
+    Args:
+        mask: 2D mask array or PIL image. Non-zero values are treated as mask.
+        point: (x, y) reference point in pixel coordinates.
+    Returns:
+        2D float32 array where each pixel is distance to point times mask value.
+        For binary masks this is zero outside the mask.
+    """
+    if point is None:
+        point = mask_barycenter(mask)
+
+    h, w = mask.shape[:2]
+    x0, y0 = float(point[0]), float(point[1])
+
+    yy, xx = np.indices((h, w), dtype=np.float32)
+    dist = np.sqrt((xx - x0) ** 2 + (yy - y0) ** 2).astype(np.float32)
+    return dist
+
+def distance_field_disk_coverage(dist, d, edge_width=1.0):
+    """Return per-pixel fraction inside a disk of radius d from distance field.
+
+    Args:
+        dist: 2D distance field where each value is center-to-pixel-center distance.
+        d: Disk radius.
+        edge_width: Width (pixels) of boundary transition for partial coverage.
+            Use 1.0 for a one-pixel antialiasing band.
+    Returns:
+        2D float32 array in [0, 1]:
+            1.0 fully inside, 0.0 fully outside, partial near boundary.
+    """
+    dist_arr = np.asarray(dist, dtype=np.float32)
+    if dist_arr.ndim > 2:
+        dist_arr = dist_arr[..., 0]
+
+    radius = float(d)
+    width = float(edge_width)
+    if width <= 0.0:
+        raise ValueError("edge_width must be > 0")
+
+    # Signed distance to the boundary: negative inside, positive outside.
+    sdf = dist_arr - radius
+    # Coverage approximation from SDF in a finite transition band.
+    coverage = np.clip(0.5 - (sdf / width), 0.0, 1.0)
+    return coverage.astype(np.float32)
+
 def ridge_from_distance(dist, min_radius=1.0, do_thin=True):
     # ridge = local maxima of dist (discrete)
     k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
@@ -1079,4 +1134,3 @@ def spot_nbhs(salamandra, pct=20, scale_factor=1.):
         srt = np.argsort(dst)
         nbh[i] = [(nbh_idx[j], dst[j], angles[j]) for j in srt]
     return nbh
-
