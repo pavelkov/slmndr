@@ -3,6 +3,21 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 import cv2
 
+
+def spot_nbhd(salamandra, pct=50, scale_factor=10.):
+    centers = [spot_center(spot) for spot in salamandra.spots]
+    dd = np.array([[dist(p0, p1) for p0 in centers] for p1 in centers])
+    dd /= np.percentile(dd, pct)
+    close = (dd > 0) & (dd <= scale_factor)
+    nbh = {}
+    for i, center in enumerate(centers):
+        nbh_idx = [int(x) for x in np.flatnonzero(close[i, :])]
+        dst = [float(dd[i, j]) for j in nbh_idx]
+        angles = [angle_to_x_axis(center, centers[j]) for j in nbh_idx]
+        srt = np.argsort(dst)
+        nbh[i] = [(nbh_idx[j], dst[j], angles[j]) for j in srt]
+    return nbh
+
 def mask_barycenter(mask):
     """Return (x, y) barycenter of non-zero mask pixels as floats."""
     mask_bool = np.asarray(mask) > 0
@@ -17,7 +32,73 @@ def mask_barycenter(mask):
 def mask_barycenter_distance_quantile_area_ratio(mask, q):
     dist = mask_distance_field_from_point(mask)
     d = np.quantile(dist, q)
-    cov = [np.clip((distance_field_disk_coverage(dist, dd) * mask).sum() / (math.pi * dd * dd), 0., 1.) for dd in d]
+    cov = np.clip(np.array([(distance_field_disk_coverage(dist, dd) * mask).sum() / (math.pi * dd * dd) for dd in d]), 0., 1.)
+    return d, cov
+
+
+def distance_field_disk_coverage_arc_bins(dist, mask, d, bins, point=None, angle_offset=0.0):
+    """Disk coverage area ratio split by angular arc bins.
+
+    Args:
+        dist: 2D distance field where each value is center-to-pixel-center distance.
+        mask: 2D mask multiplied into coverage (same convention as existing ratio).
+        d: Radius scalar or array-like of radii.
+        bins: Number of equal angular bins over [0, 360).
+        point: Optional (x, y) center used for angular binning. If None, mask barycenter.
+        angle_offset: Bin start angle in degrees.
+    Returns:
+        cov: float array with shape (len(d), bins), clipped to [0, 1].
+    """
+    bins = int(bins)
+    if bins <= 0:
+        raise ValueError("bins must be a positive integer")
+
+    mask_arr = np.asarray(mask)
+    if mask_arr.ndim > 2:
+        mask_arr = mask_arr[..., 0]
+    if point is None:
+        point = mask_barycenter(mask_arr)
+    if point is None:
+        raise ValueError("mask has no non-zero pixels; cannot infer barycenter")
+
+    h, w = mask_arr.shape[:2]
+    x0, y0 = float(point[0]), float(point[1])
+    yy, xx = np.indices((h, w), dtype=np.float32)
+    angles = (np.degrees(np.arctan2(yy - y0, xx - x0)) - float(angle_offset)) % 360.0
+    bin_idx = np.floor(angles * (bins / 360.0)).astype(np.int32)
+    bin_idx = np.clip(bin_idx, 0, bins - 1)
+
+    d_arr = np.asarray(d, dtype=np.float32).reshape(-1)
+    cov = np.zeros((d_arr.shape[0], bins), dtype=np.float32)
+    denom = math.pi * np.maximum(d_arr * d_arr, 1e-12) / float(bins)
+
+    for i, dd in enumerate(d_arr):
+        weighted = distance_field_disk_coverage(dist, float(dd)) * mask_arr
+        sums = np.bincount(bin_idx.ravel(), weights=weighted.ravel(), minlength=bins).astype(np.float32)
+        cov[i, :] = np.clip(sums / denom[i], 0.0, 1.0)
+
+    return cov
+
+
+def mask_barycenter_distance_quantile_area_ratio_arc_bins(mask, q, bins, point=None, angle_offset=0.0):
+    """`mask_barycenter_distance_quantile_area_ratio` variant with angular bins.
+
+    Returns:
+        d: Quantile radii.
+        cov: Coverage area ratios with shape (len(d), bins).
+    """
+    if point is None:
+        point = mask_barycenter(mask)
+    dist = mask_distance_field_from_point(mask, point=point)
+    d = np.quantile(dist, q)
+    cov = distance_field_disk_coverage_arc_bins(
+        dist,
+        mask,
+        d,
+        bins=bins,
+        point=point,
+        angle_offset=angle_offset,
+    )
     return d, cov
 
 
