@@ -1172,6 +1172,12 @@ def trace_direction(mask, p, a, r, a_range):
     return pp, a
 
 
+def mask_proportion(base, mask):
+    base_weight = base.sum()
+    assert base_weight > 0
+    return (mask * base).sum() / base_weight
+
+
 def trace_ridges(ridge, r, a_range):
     c = mask_barycenter(ridge)
     p0 = mask_nearest_pixel(ridge, c)
