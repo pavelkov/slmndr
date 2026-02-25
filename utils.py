@@ -36,72 +36,6 @@ def mask_barycenter_distance_quantile_area_ratio(mask, q):
     return d, cov
 
 
-def distance_field_disk_coverage_arc_bins(dist, mask, d, bins, point=None, angle_offset=0.0):
-    """Disk coverage area ratio split by angular arc bins.
-
-    Args:
-        dist: 2D distance field where each value is center-to-pixel-center distance.
-        mask: 2D mask multiplied into coverage (same convention as existing ratio).
-        d: Radius scalar or array-like of radii.
-        bins: Number of equal angular bins over [0, 360).
-        point: Optional (x, y) center used for angular binning. If None, mask barycenter.
-        angle_offset: Bin start angle in degrees.
-    Returns:
-        cov: float array with shape (len(d), bins), clipped to [0, 1].
-    """
-    bins = int(bins)
-    if bins <= 0:
-        raise ValueError("bins must be a positive integer")
-
-    mask_arr = np.asarray(mask)
-    if mask_arr.ndim > 2:
-        mask_arr = mask_arr[..., 0]
-    if point is None:
-        point = mask_barycenter(mask_arr)
-    if point is None:
-        raise ValueError("mask has no non-zero pixels; cannot infer barycenter")
-
-    h, w = mask_arr.shape[:2]
-    x0, y0 = float(point[0]), float(point[1])
-    yy, xx = np.indices((h, w), dtype=np.float32)
-    angles = (np.degrees(np.arctan2(yy - y0, xx - x0)) - float(angle_offset)) % 360.0
-    bin_idx = np.floor(angles * (bins / 360.0)).astype(np.int32)
-    bin_idx = np.clip(bin_idx, 0, bins - 1)
-
-    d_arr = np.asarray(d, dtype=np.float32).reshape(-1)
-    cov = np.zeros((d_arr.shape[0], bins), dtype=np.float32)
-    denom = math.pi * np.maximum(d_arr * d_arr, 1e-12) / float(bins)
-
-    for i, dd in enumerate(d_arr):
-        weighted = distance_field_disk_coverage(dist, float(dd)) * mask_arr
-        sums = np.bincount(bin_idx.ravel(), weights=weighted.ravel(), minlength=bins).astype(np.float32)
-        cov[i, :] = np.clip(sums / denom[i], 0.0, 1.0)
-
-    return cov
-
-
-def mask_barycenter_distance_quantile_area_ratio_arc_bins(mask, q, bins, point=None, angle_offset=0.0):
-    """`mask_barycenter_distance_quantile_area_ratio` variant with angular bins.
-
-    Returns:
-        d: Quantile radii.
-        cov: Coverage area ratios with shape (len(d), bins).
-    """
-    if point is None:
-        point = mask_barycenter(mask)
-    dist = mask_distance_field_from_point(mask, point=point)
-    d = np.quantile(dist, q)
-    cov = distance_field_disk_coverage_arc_bins(
-        dist,
-        mask,
-        d,
-        bins=bins,
-        point=point,
-        angle_offset=angle_offset,
-    )
-    return d, cov
-
-
 def mask_farthest_pixel(mask, point, max_radius=None, a0=None, a1=None):
     """Return (x, y) of the farthest non-zero mask pixel from point.
 
@@ -980,6 +914,64 @@ def mask_distance_field_from_point(mask, point=None):
     yy, xx = np.indices((h, w), dtype=np.float32)
     dist = np.sqrt((xx - x0) ** 2 + (yy - y0) ** 2).astype(np.float32)
     return dist
+
+
+def mask_arc_field_from_point(mask, point, a0, a1, edge_width=1.0):
+    """Return a soft angular mask for the sector between two angles from point.
+
+    Args:
+        mask: 2D/3D array or image used only for output height/width.
+        point: (x, y) center point in pixel coordinates.
+        a0/a1: Sector boundary angles in degrees, relative to +x axis.
+            Interval is inclusive and wrap-around is supported.
+        edge_width: Width in pixels for soft edge transition on arc boundaries.
+    Returns:
+        2D float32 array in [0, 1] where:
+            1.0 is inside the angular sector, 0.0 is outside,
+            and boundary pixels blend across a 1-pixel-style band.
+    """
+    if edge_width <= 0:
+        raise ValueError("edge_width must be > 0")
+
+    h, w = np.asarray(mask).shape[:2]
+    x0, y0 = float(point[0]), float(point[1])
+
+    # Interpret spans like (0, 360) as full circle.
+    delta = float(a1) - float(a0)
+    if np.isclose(delta % 360.0, 0.0) and not np.isclose(delta, 0.0):
+        return np.ones((h, w), dtype=np.float32)
+
+    a0m = float(a0) % 360.0
+    a1m = float(a1) % 360.0
+
+    yy, xx = np.indices((h, w), dtype=np.float32)
+    dx = xx - x0
+    dy = yy - y0
+    rr = np.sqrt(dx * dx + dy * dy)
+
+    ang = (np.degrees(np.arctan2(dy, dx)) + 360.0) % 360.0
+    if a0m <= a1m:
+        inside = (ang >= a0m) & (ang <= a1m)
+    else:
+        inside = (ang >= a0m) | (ang <= a1m)
+
+    # Distance to each boundary ray (not infinite line), in pixels.
+    a0r = np.deg2rad(a0m)
+    a1r = np.deg2rad(a1m)
+    u0x, u0y = np.cos(a0r), np.sin(a0r)
+    u1x, u1y = np.cos(a1r), np.sin(a1r)
+
+    t0 = dx * u0x + dy * u0y
+    t1 = dx * u1x + dy * u1y
+    perp0 = np.abs(dx * u0y - dy * u0x)
+    perp1 = np.abs(dx * u1y - dy * u1x)
+    d0 = np.where(t0 >= 0.0, perp0, rr)
+    d1 = np.where(t1 >= 0.0, perp1, rr)
+    d_edge = np.minimum(d0, d1)
+
+    sdf = np.where(inside, -d_edge, d_edge).astype(np.float32)
+    coverage = np.clip(0.5 - (sdf / float(edge_width)), 0.0, 1.0)
+    return coverage.astype(np.float32)
 
 def distance_field_disk_coverage(dist, d, edge_width=1.0):
     """Return per-pixel fraction inside a disk of radius d from distance field.
