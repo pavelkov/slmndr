@@ -36,6 +36,24 @@ def mask_barycenter_distance_quantile_area_ratio(mask, q):
     return d, cov
 
 
+def pad_mask(mask):
+    """Center-pad a mask into a square canvas with side 2 * max(height, width)."""
+    mask_arr = np.asarray(mask)
+    height, width = mask_arr.shape[:2]
+    side = 2 * max(height, width)
+
+    out_shape = (side, side) + mask_arr.shape[2:]
+    padded = np.zeros(out_shape, dtype=mask_arr.dtype)
+
+    y0 = (side - height) // 2
+    x0 = (side - width) // 2
+    padded[y0:y0 + height, x0:x0 + width, ...] = mask_arr
+
+    if isinstance(mask, Image.Image):
+        return Image.fromarray(padded, mode=mask.mode)
+    return padded
+
+
 def mask_farthest_pixel(mask, point, max_radius=None, a0=None, a1=None):
     """Return (x, y) of the farthest non-zero mask pixel from point.
 
@@ -465,6 +483,123 @@ def perpendicular_vector(vec):
     if n == 0.0:
         return (0.0, 0.0)
     return (px / n, py / n)
+
+
+def ncc(x, y):
+    x = np.asarray(x)
+    y = np.asarray(y)
+    xn = (x - np.mean(x)) / np.std(x)
+    yn = (y - np.mean(y)) / np.std(y)
+    r = np.correlate(xn, yn, mode='full') / len(xn)
+    rots = np.arange(-len(xn) + 1, len(xn))
+    idx = np.argmax(r)
+    rot = rots[idx]
+    dist = np.linalg.norm(x - np.roll(y, shift=rot))
+    return rot, dist
+
+
+def common_best_shift_ncc(left, right, mode="full", aggregate="sum", eps=1e-12):
+    """
+    Find a single lag that best aligns right signals to left signals (common shift)
+    by aggregating normalized cross-correlations across pairs.
+
+    Parameters
+    ----------
+    left, right : array-like, shape (M, N) or (N,)
+        M signals of length N (or single signal).
+    mode : {"full", "same", "valid"}
+        np.correlate mode. Use "full" to search all lags.
+    aggregate : {"sum", "mean"}
+        How to combine NCC curves across signals.
+    eps : float
+        Small value to avoid division by zero.
+
+    Returns
+    -------
+    best_lag : int
+        The common best lag (negative means right shifted right vs left).
+    score_at_best : float
+        Aggregated NCC value at best_lag.
+    agg_ncc : ndarray
+        Aggregated NCC curve over lags.
+    lags : ndarray
+        Lag values corresponding to agg_ncc.
+    per_pair_best_lags : ndarray, shape (M,)
+        Best lag for each pair individually.
+    """
+    L = np.asarray(left, dtype=float)
+    R = np.asarray(right, dtype=float)
+
+    if L.ndim == 1:
+        L = L[None, :]
+    if R.ndim == 1:
+        R = R[None, :]
+
+    if L.shape != R.shape:
+        raise ValueError(f"left and right must have the same shape, got {L.shape} vs {R.shape}")
+
+    M, N = L.shape
+
+    # z-score each signal independently (global normalization per signal)
+    Lm = L.mean(axis=1, keepdims=True)
+    Rm = R.mean(axis=1, keepdims=True)
+    Ls = L.std(axis=1, keepdims=True)
+    Rs = R.std(axis=1, keepdims=True)
+
+    Lz = (L - Lm) / np.maximum(Ls, eps)
+    Rz = (R - Rm) / np.maximum(Rs, eps)
+
+    # compute NCC curves and aggregate
+    ncc_list = []
+    per_pair_best = np.empty(M, dtype=int)
+
+    for i in range(M):
+        ncc = np.correlate(Lz[i], Rz[i], mode=mode) / N
+        ncc_list.append(ncc)
+
+        # lags depend on mode
+        if mode == "full":
+            lags_i = np.arange(-N + 1, N)
+        elif mode == "same":
+            # centered lags
+            lags_i = np.arange(-(N // 2), -(N // 2) + len(ncc))
+        elif mode == "valid":
+            lags_i = np.arange(0, len(ncc))  # only non-negative overlap shifts
+        else:
+            raise ValueError("mode must be 'full', 'same', or 'valid'")
+
+        per_pair_best[i] = lags_i[np.argmax(ncc)]
+
+    ncc_stack = np.vstack(ncc_list)
+
+    if aggregate == "sum":
+        agg_ncc = ncc_stack.sum(axis=0)
+    elif aggregate == "mean":
+        agg_ncc = ncc_stack.mean(axis=0)
+    else:
+        raise ValueError("aggregate must be 'sum' or 'mean'")
+
+    # lag axis (same for all pairs because same N and same mode)
+    if mode == "full":
+        lags = np.arange(-N + 1, N)
+    elif mode == "same":
+        lags = np.arange(-(N // 2), -(N // 2) + agg_ncc.size)
+    else:  # valid
+        lags = np.arange(0, agg_ncc.size)
+
+    best_idx = int(np.argmax(agg_ncc))
+    best_lag = int(lags[best_idx])
+    score_at_best = float(agg_ncc[best_idx])
+
+    return best_lag, score_at_best, agg_ncc, lags, per_pair_best
+
+
+def descriptor_rotation_and_score(x, y):
+    rot, score = common_best_shift_ncc(x, y)[0:2]
+    dist = np.linalg.norm(x - np.roll(y, shift=rot, axis=1))
+    return rot, dist
+    
+
 
 
 def overlay_points(image, points, color=(255, 0, 0), radius=3, alpha=0.8):
@@ -1174,7 +1309,8 @@ def trace_direction(mask, p, a, r, a_range):
 
 def mask_proportion(base, mask):
     base_weight = base.sum()
-    assert base_weight > 0
+    if base_weight == 0:
+        return 0
     return (mask * base).sum() / base_weight
 
 
@@ -1213,3 +1349,16 @@ def spot_nbhs(salamandra, pct=20, scale_factor=1.):
         srt = np.argsort(dst)
         nbh[i] = [(nbh_idx[j], dst[j], angles[j]) for j in srt]
     return nbh
+
+
+def mask_descriptor(mask):
+    import itertools
+    mask = pad_mask(mask)
+    dist = mask_distance_field_from_point(mask)
+    p = mask_barycenter(mask)
+    direction_masks = [mask_arc_field_from_point(mask, p, a-10, a+10) for a in np.arange(0., 360., 1.)]
+    max_d = np.quantile(dist * mask, .99)
+    steps = np.linspace(0, 2 * max_d, 5)[1:]
+    distance_masks = [distance_field_disk_coverage(dist, d1) * distance_field_disk_coverage(dist, d0) for d0, d1 in itertools.pairwise(steps)]
+    return np.array([[mask_proportion(dirmask * dstmask, mask) for dirmask in direction_masks] for dstmask in distance_masks])
+
